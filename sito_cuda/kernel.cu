@@ -1,84 +1,74 @@
-﻿#include <iostream>
 #include <cuda_runtime.h>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-__global__ void sieve(long long* numbers, long long n, int blockSize, int numChunks) {
-    int chunkId = blockIdx.x; // Identyfikator bloku w wymiarze X
-    int threadId = threadIdx.x; // Identyfikator watku w wymiarze X
-    long long start = chunkId * blockSize + threadId + 2; // Początkowy indeks przetwarzany przez wątek w danym bloku
-    long long step = numChunks * blockSize; // Odstęp między liczbami przetwarzanymi przez dwa kolejne wątki
+#define CUDA_CHECK(call) do { const cudaError_t status = (call); \
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status)); } while (false)
 
-    for (long long index = start; index <= n; index += step) {
-        if (numbers[index] != 0) {
-            for (long long i = 2 * index; i <= n; i += index) {
-                numbers[i] = 0;
-            }
-        }
-    }
+// For one prime, every thread marks a disjoint arithmetic subsequence.
+// Kernels for successive base primes run serially in the default stream.
+__global__ void mark_composites(unsigned char* flags, std::uint64_t limit, std::uint64_t prime) {
+    const std::uint64_t tid = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+    const std::uint64_t stride = gridDim.x * static_cast<std::uint64_t>(blockDim.x);
+    for (std::uint64_t value = prime * prime + tid * prime; value <= limit; value += stride * prime)
+        flags[value] = 0;
 }
 
-int main() {
-    long long n = 1000000000;  // Liczba pierwszych do obliczenia
-    int blockSize = 256;  // Rozmiar bloku wątków CUDA
-    int numChunks = 8;  // Liczba fragmentów do równoczesnego przetwarzania
-    int numBlocks = numChunks;
-    long long* h_numbers = new long long[n + 1];  // Tablica na CPU do algorytmu sita
+int main(int argc, char** argv) {
+    unsigned char* device = nullptr;
+    cudaEvent_t start = nullptr, stop = nullptr;
+    try {
+        std::size_t consumed = 0;
+        const std::string text = argc > 1 ? argv[1] : "1000000";
+        const std::uint64_t limit = std::stoull(text, &consumed);
+        if (argc > 2 || consumed != text.size() || limit < 2 || limit > 1000000000ULL)
+            throw std::invalid_argument("Usage: sieve_cuda [inclusive-limit: 2..1000000000]");
 
-    // Inicjalizacja tablicy na CPU
-    for (long long i = 2; i <= n; i++) {
-        h_numbers[i] = i;
-    }
-
-    // Inicjalizacja timerów CUDA
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    // Rozpoczęcie pomiaru czasu
-    cudaEventRecord(start);
-
-    // Alokuje pamięć na GPU
-    long long* d_numbers;
-    cudaMalloc((void**)&d_numbers, (n + 1) * sizeof(long long));
-
-    // Kopiuje dane z CPU do GPU
-    cudaMemcpy(d_numbers, h_numbers, (n + 1) * sizeof(long long), cudaMemcpyHostToDevice);
-
-    // Uruchamia kernel CUDA z wieloma blokami
-    sieve << <numBlocks, blockSize >> > (d_numbers, n, blockSize, numChunks);
-
-
-
-    // Kopiuje wyniki z GPU na CPU
-    cudaMemcpy(h_numbers, d_numbers, (n + 1) * sizeof(long long), cudaMemcpyDeviceToHost);
-
-    // Zakończenie pomiaru czasu
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    // Oblicza sumę liczb pierwszych
-    long long sum = 0;
-
-    std::cout << "Liczby pierwsze: ";
-    for (long long i = 2; i <= n; i++) {
-        if (h_numbers[i] != 0) {
-            sum += h_numbers[i];
-            //std::cout << h_numbers[i] << " ";
+        std::vector<unsigned char> flags(limit + 1, 1);
+        flags[0] = flags[1] = 0;
+        const auto root = static_cast<std::uint64_t>(std::sqrt(static_cast<double>(limit)));
+        std::vector<unsigned char> bases(root + 1, 1);
+        std::vector<std::uint64_t> primes;
+        for (std::uint64_t p = 2; p <= root; ++p) {
+            if (!bases[p]) continue;
+            primes.push_back(p);
+            for (std::uint64_t multiple = p * p; multiple <= root; multiple += p)
+                bases[multiple] = 0;
         }
+
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device), flags.size()));
+        CUDA_CHECK(cudaMemcpy(device, flags.data(), flags.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (auto prime : primes) {
+            mark_composites<<<256, 256>>>(device, limit, prime);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaMemcpy(flags.data(), device, flags.size(), cudaMemcpyDeviceToHost));
+        float elapsed = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+        std::uint64_t sum = 0, count = 0;
+        for (std::uint64_t i = 2; i <= limit; ++i) {
+            if (flags[i]) { sum += i; ++count; }
+        }
+        std::cout << "Inclusive limit: " << limit << " Count: " << count << " Sum: " << sum
+                  << " Kernel milliseconds (excluding transfers): " << elapsed << '\n';
+        CUDA_CHECK(cudaFree(device)); device = nullptr;
+        CUDA_CHECK(cudaEventDestroy(start)); start = nullptr;
+        CUDA_CHECK(cudaEventDestroy(stop)); stop = nullptr;
+        return 0;
+    } catch (const std::exception& error) {
+        if (device) cudaFree(device);
+        if (start) cudaEventDestroy(start);
+        if (stop) cudaEventDestroy(stop);
+        std::cerr << error.what() << '\n';
+        return 1;
     }
-    std::cout << std::endl;
-
-    std::cout << "Suma " << n << " liczb pierwszych: " << sum << std::endl;
-
-    // Obliczanie czasu trwania
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    std::cout << "Czas obliczen na GPU: " << milliseconds << " ms" << std::endl;
-
-    // Zwolnienie pamięci i timerów
-    delete[] h_numbers;
-    cudaFree(d_numbers);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    return 0;
 }
