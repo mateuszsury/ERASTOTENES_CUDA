@@ -6,6 +6,14 @@ repository name is retained for existing links.
 * `sito_sekwencyjne/main.py`: sequential Python reference (small input by default).
 * `sito_cuda/kernel.cu`: CUDA sieve and elapsed-time measurement.
 
+## Project overview
+
+Educational prime-number sieves with checked CPU references and CUDA compilation.
+
+![Prime sieves: CPU + CUDA — Implementation overview. Kernel timing is distinct from transfers; no GPU performance measurement is implied.](docs/assets/presentation/overview.svg)
+
+Implementation overview. Kernel timing is distinct from transfers; no GPU performance measurement is implied.
+
 ## Run
 
 ```sh
